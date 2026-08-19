@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Optional, Dict, List
 from bs4 import BeautifulSoup
 from .auth_manager import AuthManager
+from .drm import build_pssh, fetch_decryption_key
 
 @dataclass
 class MovieInfo:
@@ -210,104 +211,60 @@ class DownloadManager:
                 
             kid = kid_match.group(1).replace('-', '')
             pssh = self._generate_pssh(kid)
+            playready_pssh = self._extract_playready_pssh(secure_url)
             
             # Get decryption key
             dt_custom_data = headers.get('dt-custom-data')
             if not dt_custom_data:
                 raise ValueError("Missing required dt-custom-data header")
             
-            decryption_key = self._fetch_decryption_key(pssh, dt_custom_data)
+            decryption_key = self._fetch_decryption_key(pssh, dt_custom_data, playready_pssh=playready_pssh)
             return decryption_key, secure_url
         except Exception as e:
             self.logger.error(f"Failed to get encryption info: {str(e)}")
             raise
+
+    def _extract_playready_pssh(self, secure_url: str) -> Optional[str]:
+        """Extract the PlayReady PSSH box from the video init segment.
+
+        DRMtoday rejects cdmpool's Widevine device for Mubi, so the content
+        keys are requested through PlayReady instead. The PlayReady PSSH is
+        embedded in the video init segment referenced by the MPD.
+        """
+        try:
+            manifest = requests.get(secure_url).text
+            base_url = re.search(r'<BaseURL>([^<]+)</BaseURL>', manifest)
+            init_template = re.search(r'<SegmentTemplate[^>]*initialization="([^"]+)"', manifest)
+            rep_match = re.search(r'<Representation[^>]*id="video=[^"]*"[^>]*>', manifest)
+            if not base_url or not init_template or not rep_match:
+                self.logger.debug("Could not locate init segment template in MPD")
+                return None
+            rep_id = re.search(r'id="(video=[^"]+)"', rep_match.group(0)).group(1)
+            init_url = secure_url.rsplit('/', 1)[0] + '/' + base_url.group(1).rstrip('/') + '/' + init_template.group(1).replace('$RepresentationID$', rep_id)
+            self.logger.debug(f"Fetching init segment: {init_url}")
+            init_data = requests.get(init_url).content
+
+            # Find the pssh box (may be nested inside moov)
+            for offset in range(len(init_data) - 7):
+                if init_data[offset:offset + 4] == b'pssh':
+                    size = int.from_bytes(init_data[offset - 4:offset], 'big')
+                    box = init_data[offset - 4:offset - 4 + size]
+                    system_id = box[12:28].hex()
+                    if system_id == '9a04f07998404286ab92e65be0885f95':
+                        self.logger.debug("Found PlayReady PSSH in init segment")
+                        return base64.b64encode(box).decode('utf-8')
+            self.logger.debug("No PlayReady PSSH found in init segment")
+        except Exception as e:
+            self.logger.debug(f"Failed to extract PlayReady PSSH: {e}")
+        return None
     
     def _generate_pssh(self, key_id: str) -> str:
         """Generates PSSH box for decryption"""
-        array_of_bytes = bytearray(b'2pssh')
-        array_of_bytes.extend(bytes.fromhex("edef8ba979d64acea3c827dcd51d21ed"))
-        array_of_bytes.extend(b'')
-        array_of_bytes.extend(bytes.fromhex(key_id))
-        return base64.b64encode(bytes.fromhex(array_of_bytes.hex())).decode('utf-8')
+        return build_pssh(key_id)
     
-    def _fetch_decryption_key(self, pssh: str, dt_custom_data: str) -> str:
-        """Fetches decryption key from CDM project"""
-        # Make sure dt_custom_data is properly formatted
-        try:
-            headers_json = json.loads(base64.b64decode(dt_custom_data))
-            # Format headers according to CDM project requirements
-            formatted_headers = {
-                "dt-custom-data": dt_custom_data,
-                "authorization": f"Bearer {headers_json.get('sessionId', '')}"
-            }
-        except:
-            formatted_headers = {"dt-custom-data": dt_custom_data}
-
-        try:
-            # Get CDM server endpoint first
-            cdm_url = 'https://cdrm-project.com/api/cdm/L3'
-            self.logger.debug(f"Using CDM endpoint: {cdm_url}")
-            
-            self.logger.debug(f"Requesting license with headers: {formatted_headers}")
-            response = requests.post(
-                cdm_url,
-                headers={
-                    'Content-Type': 'application/json',
-                    'User-Agent': 'Mozilla/5.0 Chrome/121.0.0.0',
-                    'Accept': 'application/json'
-                },
-                json={
-                    'license': 'https://lic.drmtoday.com/license-proxy-widevine/cenc/?specConform=true',
-                    'headers': formatted_headers,
-                    'pssh': pssh,
-                    'buildInfo': {
-                        'type': 'chrome',
-                        'version': '121.0.0.0',
-                        'architecture': 'x86_64'
-                    },
-                    'capabilities': {
-                        'securityLevel': 3,
-                        'hdcpVersion': 'HDCP_V2_2',
-                        'supportedKeySystems': ['com.widevine.alpha']
-                    }
-                },
-                timeout=30
-            )
-            
-            if response.status_code != 200:
-                self.logger.error(f"CDM Project API error: {response.status_code}")
-                self.logger.debug(f"Response content: {response.text}")
-                self.logger.debug(f"Request headers used: {formatted_headers}")
-                raise ValueError(f"CDM Project API returned {response.status_code}: {response.text}")
-                
-            # Response should contain the key pairs
-            response_data = response.json()
-            if 'keys' not in response_data:
-                self.logger.error("No keys found in response")
-                self.logger.debug(f"Response data: {response_data}")
-                raise ValueError("No decryption keys found in response")
-                
-            # Format key response
-            keys = []
-            for key in response_data['keys']:
-                if 'kid' in key and 'key' in key:
-                    keys.append(f"{key['kid']}:{key['key']}")
-                    
-            if not keys:
-                raise ValueError("No valid key pairs found in response")
-                
-            return f"key_id={keys[0].replace(':', ':key=')}"
-            
-        except Exception as e:
-            self.logger.error(f"Failed to obtain decryption key: {e}")
-            self.logger.exception("Detailed decryption error:")
-            raise ValueError("Failed to obtain decryption key")
-            
-        key_match = re.search(r"([a-f0-9]{16,}:[a-f0-9]{16,})", str(response.text))
-        if not key_match:
-            raise ValueError("Failed to obtain decryption key")
-            
-        return f"key_id={key_match.group(1).replace(':', ':key=')}"
+    def _fetch_decryption_key(self, pssh: str, dt_custom_data: str, playready_pssh: str = None) -> str:
+        """Fetches decryption key via the cdmpool.xyz extraction API"""
+        return fetch_decryption_key(pssh, dt_custom_data, playready_pssh=playready_pssh)
     
     def _prepare_headers(self) -> Dict:
         """Prepares headers for API requests"""

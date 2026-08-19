@@ -118,8 +118,15 @@ if [ ! -d "$MODULE_PATH" ]; then
     exit 1
 fi
 
+# Install the package in editable mode so `python -m mubi_downloader` works
+if [ ! -f ".venv/package_installed" ]; then
+    echo -e "${BLUE}Installing mubi_downloader package...${NC}"
+    pip install -e .
+    touch .venv/package_installed
+fi
+
 # Add the src directory to PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:$(pwd)"
+export PYTHONPATH="$PYTHONPATH:$(pwd)/src"
 
 # Run the mubi downloader
 echo -e "${GREEN}Starting Mubi Downloader...${NC}"

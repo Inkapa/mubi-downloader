@@ -163,30 +163,48 @@ class AuthManager:
         try:
             cursor = conn.cursor()
             
-            # Check if cookies table exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='cookies'")
-            if not cursor.fetchone():
+            # Detect schema: Chrome/Edge use a 'cookies' table with host_key/encrypted_value,
+            # Firefox uses a 'moz_cookies' table with host/value.
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = [r[0] for r in cursor.fetchall()]
+            if 'moz_cookies' in tables:
+                cookie_table = 'moz_cookies'
+                host_col = 'host'
+                name_col = 'name'
+                value_col = 'value'
+                encrypted_col = None
+                secure_col = 'isSecure'
+                path_col = 'path'
+                expires_col = 'expiry'
+                httponly_col = 'isHttpOnly'
+            elif 'cookies' in tables:
+                cookie_table = 'cookies'
+                host_col = 'host_key'
+                name_col = 'name'
+                value_col = 'value'
+                encrypted_col = 'encrypted_value'
+                secure_col = 'is_secure'
+                path_col = 'path'
+                expires_col = 'expires_utc'
+                httponly_col = 'is_httponly'
+            else:
                 self.logger.debug("No cookies table found in database")
                 return []
-                
+            
             # Get all possible cookie fields
             # First try to find auth tokens directly
-            auth_query = """
-                SELECT name, value, encrypted_value
-                FROM cookies
-                WHERE host_key LIKE '%.mubi.com'
-                AND name IN ('authToken', 'dtCustomData')
+            auth_query = f"""
+                SELECT {name_col}, {value_col}
+                FROM {cookie_table}
+                WHERE {host_col} LIKE '%.mubi.com'
+                AND {name_col} IN ('authToken', 'dtCustomData')
             """
             self.logger.debug("Executing auth query")
             cursor.execute(auth_query)
             found_auth = False
             found_dt = False
 
-            for name, value, encrypted_value in cursor.fetchall():
-                if not value and encrypted_value:
-                    self.logger.debug(f"Found encrypted auth cookie: {name}")
-                    value = self._decrypt_chrome_cookies(encrypted_value)
-                    
+            for name, value in cursor.fetchall():
                 if value:
                     if name == 'authToken':
                         self.auth_token = value
@@ -200,25 +218,32 @@ class AuthManager:
             self.logger.debug(f"Auth token found: {found_auth}, dt-custom-data found: {found_dt}")
 
             # Now get all cookies for the domain
-            query = """
-                SELECT host_key, name, value, encrypted_value, is_secure,
-                       path, expires_utc, is_httponly
-                FROM cookies
-                WHERE host_key LIKE '%.mubi.com' OR host_key = 'mubi.com'
-            """
+            if encrypted_col:
+                query = f"""
+                    SELECT {host_col}, {name_col}, {value_col}, {encrypted_col}, {path_col}, {expires_col}, {secure_col}, {httponly_col}
+                    FROM {cookie_table}
+                    WHERE {host_col} LIKE '%.mubi.com' OR {host_col} = 'mubi.com'
+                """
+            else:
+                query = f"""
+                    SELECT {host_col}, {name_col}, {value_col}, {path_col}, {expires_col}, {secure_col}, {httponly_col}
+                    FROM {cookie_table}
+                    WHERE {host_col} LIKE '%.mubi.com' OR {host_col} = 'mubi.com'
+                """
             self.logger.debug("Executing cookie query")
             cursor.execute(query)
             
             cookies = []
             for row in cursor.fetchall():
                 try:
-                    host_key, name, value, encrypted_value, is_secure = row[:5]
-                    path, expires_utc, is_httponly = row[5:8]
+                    if encrypted_col:
+                        host_key, name, value, encrypted_value, path, expires, is_secure, is_httponly = row
+                        if not value and encrypted_value:
+                            self.logger.debug(f"Found encrypted cookie: {name}")
+                            value = self._decrypt_chrome_cookies(encrypted_value)
+                    else:
+                        host_key, name, value, path, expires, is_secure, is_httponly = row
                     
-                    if not value and encrypted_value:
-                        self.logger.debug(f"Found encrypted cookie: {name}")
-                        value = self._decrypt_chrome_cookies(encrypted_value)
-                            
                     if value:
                         domain = host_key.lstrip('.')
                         self.logger.debug(f"Processing cookie - Domain: {domain}, Name: {name}")
@@ -228,7 +253,7 @@ class AuthManager:
                             value=value,
                             secure=bool(is_secure),
                             path=path,
-                            expires=expires_utc,
+                            expires=expires,
                             httponly=bool(is_httponly)
                         )
                         cookies.append(cookie)
@@ -604,6 +629,18 @@ class AuthManager:
                     elif cookie.name == "dtCustomData" and not dt_custom_data:
                         dt_custom_data = cookie.value
                         self.logger.debug(f"Found dtCustomData cookie on {domain}")
+
+        # Current Mubi uses the 'lt' cookie as the bearer session token
+        if not auth_token:
+            for cookie in cookies:
+                if cookie.name == "lt" and cookie.value:
+                    auth_token = cookie.value
+                    self.logger.debug("Found lt cookie, using as bearer token")
+                    break
+
+        # Build dt-custom-data from the session if not available as a cookie
+        if not dt_custom_data:
+            dt_custom_data = self._build_dt_custom_data(auth_token)
         
         if auth_token and dt_custom_data:
             valid, headers = self._validate_token(auth_token, dt_custom_data)
@@ -614,6 +651,44 @@ class AuthManager:
         else:
             self.logger.debug("Missing required cookies")
         return {}
+
+    def _build_dt_custom_data(self, auth_token: Optional[str]) -> Optional[str]:
+        """Build the DRMtoday dt-custom-data header from the current Mubi session."""
+        env_value = os.environ.get('MUBI_DT_CUSTOM_DATA')
+        if env_value:
+            self.logger.debug("Using dt-custom-data from MUBI_DT_CUSTOM_DATA")
+            return env_value
+
+        if not auth_token:
+            return None
+        try:
+            import requests
+            self.logger.debug("Fetching user id to build dt-custom-data")
+            response = requests.get(
+                'https://api.mubi.com/v3/current_user',
+                headers={
+                    'Client': 'web',
+                    'Client-Version': '1.0.0',
+                    'Client-Device': 'desktop',
+                    'Client-Country': 'US',
+                    'Accept': 'application/json',
+                    'Authorization': f'Bearer {auth_token}',
+                },
+                timeout=30,
+            )
+            user_id = response.json().get('id')
+            if not user_id:
+                self.logger.debug("Could not determine user id")
+                return None
+            custom_data = json.dumps({
+                'userId': user_id,
+                'sessionId': auth_token,
+                'merchant': 'mubi',
+            }).encode('utf-8')
+            return base64.b64encode(custom_data).decode('utf-8')
+        except Exception as e:
+            self.logger.debug(f"Failed to build dt-custom-data: {e}")
+            return None
 
     def _extract_headers_from_active_session(self, movie_url: str) -> Optional[Dict[str, str]]:
         """Extract authentication headers from an active browser session streaming a movie"""

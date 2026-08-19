@@ -85,11 +85,19 @@ class TestDownloadManager:
             mock_response2 = Mock()
             mock_response2.text = 'default_KID="12345678-1234-1234-1234-123456789012"'
             
-            mock_get.side_effect = [mock_response1, mock_response2]
+            # Mock PlayReady PSSH extraction (no matching init template -> None)
+            mock_mpd = Mock()
+            mock_mpd.text = '<BaseURL>dash/</BaseURL>'
             
-            # Mock CDM project response with proper hex format
+            mock_get.side_effect = [mock_response1, mock_response2, mock_mpd, mock_mpd]
+            
+            # Mock cdmpool response
             mock_post_response = Mock()
-            mock_post_response.text = "abcd1234abcd1234:efef5678efef5678"
+            mock_post_response.status_code = 200
+            mock_post_response.json.return_value = {
+                'ok': True,
+                'keys': [{'kid': 'abcd1234abcd1234abcd1234abcd1234', 'key': 'efef5678efef5678efef5678efef5678'}]
+            }
             
             with patch('requests.post') as mock_post:
                 mock_post.return_value = mock_post_response
@@ -99,7 +107,7 @@ class TestDownloadManager:
                 )
                 
                 assert secure_url == 'https://test.com/video'
-                assert decryption_key == 'key_id=abcd1234abcd1234:key=efef5678efef5678'
+                assert decryption_key == 'key_id=abcd1234abcd1234abcd1234abcd1234:key=efef5678efef5678efef5678efef5678'
 
     @patch('os.system')
     def test_download_and_decrypt(self, mock_system, download_manager, movie_info, tmp_path):

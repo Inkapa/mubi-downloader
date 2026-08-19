@@ -82,10 +82,10 @@ Examples:
         
         # Check for WSL2 environment
         if env.is_wsl:
-            cookie_path = env.get_wsl_cookie_path(browser)
-            if cookie_path:
-                logger.debug(f"Using WSL2 cookie path: {cookie_path}")
-                os.environ['BROWSER_COOKIE_PATH'] = cookie_path
+            cookie_paths = env.get_wsl_cookie_paths(browser)
+            if cookie_paths:
+                logger.debug(f"Using WSL2 cookie paths: {cookie_paths}")
+                os.environ['BROWSER_COOKIE_PATH'] = ','.join(cookie_paths)
 
         # Initialize components
         auth_manager = AuthManager(browser, debug=args.debug)
@@ -109,8 +109,8 @@ Examples:
         logger.info(f"\nFound movie: {movie_info.full_title}")
         logger.debug(f"Movie details: {vars(movie_info)}")
         
-        # Check availability
-        if user_country in movie_info.available_countries:
+        # Check availability (manual entries carry no country list, so let them through)
+        if not movie_info.available_countries or user_country in movie_info.available_countries:
             logger.info(f"Movie is available in your location ({user_country})")
             logger.debug(f"Available countries: {movie_info.available_countries}")
             print(f"\nPlease open {movie_info.mubi_url} in your browser and start playing the movie")
